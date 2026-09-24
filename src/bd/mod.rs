@@ -28,8 +28,17 @@ fn resolve_bd() -> String {
 }
 
 /// Run a bd subcommand, returning stdout. Errors carry bd's stderr.
+/// A Command in its own process group, so closing the board's pane mid-write can't hang it up
+/// halfway (`bd human respond` comments, then closes).
+pub fn command(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(program);
+    cmd.process_group(0);
+    cmd
+}
+
 pub fn run(scope: Scope, args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new(resolve_bd());
+    let mut cmd = command(&resolve_bd());
     // Ensure Homebrew is on PATH even under herdr's minimal launch environment.
     if let Ok(path) = std::env::var("PATH") {
         cmd.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:{path}"));
@@ -231,7 +240,7 @@ pub fn update_bead(scope: Scope, id: &str, nb: &NewBead) -> Result<()> {
 /// so the UI never waits on one: it queues a job and applies the reply later.
 pub enum Job {
     Load { gen: u64, scope: Scope, closed: bool },
-    Show { scope: Scope, id: String },
+    Show { scope: Scope, id: String, seq: u64 },
     /// Read the repo's review command (see `review_command`).
     ReviewCmd { scope: Scope },
     /// A write. Ok carries the status message to show.
@@ -240,9 +249,9 @@ pub enum Job {
 
 pub enum Reply {
     Loaded { gen: u64, beads: Result<Vec<Bead>> },
-    Shown { id: String, bead: Bead },
+    Shown { id: String, bead: Bead, seq: u64 },
     Wrote(Result<String>),
-    ReviewCmd(Vec<String>),
+    ReviewCmd(std::result::Result<Vec<String>, String>),
     /// A launch (L) exited; Err carries its last output line.
     Launched(std::result::Result<(), String>),
 }
@@ -268,12 +277,12 @@ pub fn spawn_worker() -> (Sender<Job>, Sender<Reply>, Receiver<Reply>, std::thre
                         gen,
                         beads: load(scope, closed),
                     },
-                    Job::Show { scope, id } => match show(scope, &id) {
-                        Ok(Some(bead)) => Reply::Shown { id, bead },
+                    Job::Show { scope, id, seq } => match show(scope, &id) {
+                        Ok(Some(bead)) => Reply::Shown { id, bead, seq },
                         _ => continue,
                     },
                     Job::ReviewCmd { scope } => {
-                        Reply::ReviewCmd(review_command(scope).unwrap_or_default())
+                        Reply::ReviewCmd(review_command(scope).map_err(|e| e.to_string()))
                     }
                     Job::Write(f) => Reply::Wrote(f()),
                 };
@@ -307,7 +316,7 @@ mod tests {
     #[test]
     fn worker_skips_stale_loads_and_shows_but_never_writes() {
         let load = |gen| Job::Load { gen, scope: Scope::Repo, closed: false };
-        let show = |id: &str| Job::Show { scope: Scope::Repo, id: id.into() };
+        let show = |id: &str| Job::Show { scope: Scope::Repo, id: id.into(), seq: 0 };
         let write = || Job::Write(Box::new(|| Ok(String::new())));
         let batch = vec![load(1), show("a"), write(), load(2), show("b"), write(), show("c")];
         assert_eq!(

@@ -108,12 +108,14 @@ pub fn render_activity_bar(f: &mut Frame, area: Rect, app: &mut App) {
 /// The bottom bar's key hint: what you can do with what's selected.
 pub fn hint(app: &App) -> String {
     let h = if app.human_only { "H all" } else { "H queue" };
+    // The popup is session-modal: q is its only way out, so it leads there.
+    let q = if app.mode == Mode::Popup { "q close · " } else { "" };
     match app.selected_bead() {
         _ if app.move_mode => "MOVE: h/l retag · v/Esc exit".into(),
         Some(b) if b.is_verify() => {
-            format!("✔ L launch Godot · P pass · R fail+notes · {h} · ? help")
+            format!("{q}✔ L launch Godot · P pass · R fail+notes · {h} · ? help")
         }
-        Some(b) if b.needs_human() => format!("⚑ R answer · {h} · d details · ? help"),
+        Some(b) if b.needs_human() => format!("{q}⚑ R answer · {h} · d details · ? help"),
         _ if app.mode == Mode::Popup => {
             "q close board · K view · j/k move · c claim · x close · a new · / filter · H human queue · ? help".into()
         }

@@ -61,8 +61,16 @@ pub struct App {
     worker: Option<std::thread::JoinHandle<()>>,
     /// For threads outside the worker (a launch waiting on its process).
     replies_tx: Sender<bd::Reply>,
-    /// The repo's review command (None until the worker has read it; empty when unset).
-    pub review_cmd: Option<Vec<String>>,
+    /// The repo's review command: None until the worker has read it; Ok(empty) when unset;
+    /// Err when bd couldn't read it.
+    pub review_cmd: Option<Result<Vec<String>, String>>,
+    /// Verify items launched (L) from this board: P passes them in one press, others in two.
+    pub launched: HashSet<String>,
+    /// The id a first P on an unlaunched item asked about; a second P passes it.
+    confirm_pass: Option<String>,
+    /// Numbers each Show; `detail_after` drops replies to Shows sent before an invalidation.
+    pub show_seq: u64,
+    detail_after: HashMap<String, u64>,
     /// A bd error is on the status line: the reload after it keeps it there until the next key.
     pub error_shown: bool,
     load_gen: u64,
@@ -101,6 +109,10 @@ impl App {
             replies_tx,
             worker: Some(worker),
             review_cmd: None,
+            launched: HashSet::new(),
+            confirm_pass: None,
+            show_seq: 0,
+            detail_after: HashMap::new(),
             error_shown: false,
             load_gen: 0,
             load_queued: std::time::Instant::now(),
@@ -149,13 +161,21 @@ impl App {
     /// Apply every finished bd call. Returns true if anything changed.
     pub fn apply_replies(&mut self) -> bool {
         let replies: Vec<_> = self.replies.try_iter().collect();
-        let changed = !replies.is_empty();
+        let mut changed = !replies.is_empty();
+        if self.worker.as_ref().is_some_and(|w| w.is_finished()) {
+            self.worker = None;
+            self.status_msg = "bd worker died - restart the pane (q, then reopen it)".into();
+            self.error_shown = true;
+            changed = true;
+        }
         for reply in replies {
             match reply {
                 bd::Reply::Loaded { gen, beads } if gen == self.load_gen => self.apply_load(beads),
                 bd::Reply::Loaded { .. } => {}
-                bd::Reply::Shown { id, bead } => {
-                    self.detail_cache.insert(id, bead);
+                bd::Reply::Shown { id, bead, seq } => {
+                    if self.detail_after.get(&id).is_none_or(|after| seq > *after) {
+                        self.detail_cache.insert(id, bead);
+                    }
                 }
                 bd::Reply::Wrote(Ok(msg)) => self.status_msg = msg,
                 bd::Reply::Wrote(Err(e)) => {
@@ -163,8 +183,11 @@ impl App {
                     self.error_shown = true;
                 }
                 bd::Reply::ReviewCmd(argv) => self.review_cmd = Some(argv),
-                bd::Reply::Launched(Ok(())) => {}
-                bd::Reply::Launched(Err(e)) => self.status_msg = format!("launch failed: {e}"),
+                bd::Reply::Launched(Ok(())) => self.status_msg = "review launch finished".into(),
+                bd::Reply::Launched(Err(e)) => {
+                    self.status_msg = e;
+                    self.error_shown = true;
+                }
             }
         }
         changed
@@ -318,9 +341,17 @@ impl App {
         if let Some(id) = self.selected.clone() {
             if !self.detail_cache.contains_key(&id) {
                 let scope = self.scope;
-                self.queue(bd::Job::Show { scope, id });
+                self.show_seq += 1;
+                let seq = self.show_seq;
+                self.queue(bd::Job::Show { scope, id, seq });
             }
         }
+    }
+
+    /// Forget `id`'s detail, and ignore any Show of it already in flight (it predates the change).
+    pub fn invalidate_detail(&mut self, id: &str) {
+        self.detail_cache.remove(id);
+        self.detail_after.insert(id.to_string(), self.show_seq);
     }
 
     fn locate_kanban(&self, id: &str) -> Option<(usize, usize)> {
@@ -654,7 +685,7 @@ impl App {
                 if !buf.is_empty() {
                     let (scope, noted) = (self.scope, id.clone());
                     self.queue_write(move || bd::add_note(scope, &noted, &buf).map(|_| "noted".into()));
-                    self.detail_cache.remove(&id);
+                    self.invalidate_detail(&id);
                     self.refresh_detail();
                 }
             }
@@ -693,7 +724,7 @@ impl App {
                 if !buf.is_empty() {
                     let (scope, on) = (self.scope, id.clone());
                     self.queue_write(move || bd::add_comment(scope, &on, &buf).map(|_| "commented".into()));
-                    self.detail_cache.remove(&id);
+                    self.invalidate_detail(&id);
                     self.refresh_detail();
                 }
             }
@@ -736,10 +767,11 @@ impl App {
     pub fn launch_argv(&self, id: &str) -> Result<Vec<String>, String> {
         match &self.review_cmd {
             None => Err("still reading this repo's review command, try again in a moment".into()),
-            Some(cmd) if cmd.is_empty() => {
+            Some(Err(e)) => Err(format!("couldn't read custom.herdr-beads.review: {e}")),
+            Some(Ok(cmd)) if cmd.is_empty() => {
                 Err("no custom.herdr-beads.review in this repo's bd config".into())
             }
-            Some(cmd) => Ok(cmd
+            Some(Ok(cmd)) => Ok(cmd
                 .iter()
                 .cloned()
                 .chain(["launch".into(), id.to_string()])
@@ -754,11 +786,24 @@ impl App {
             self.status_msg = "L launches a verify item (labels human + verify)".into();
             return;
         };
-        let argv = match self.launch_argv(&b.id) {
+        let id = b.id.clone();
+        let argv = match self.launch_argv(&id) {
             Ok(a) => a,
-            Err(e) => return self.status_msg = e,
+            Err(e) => {
+                // Unset or unreadable: read it again, so setting it doesn't need a redeploy.
+                if matches!(self.review_cmd, Some(Ok(ref c)) if c.is_empty())
+                    || matches!(self.review_cmd, Some(Err(_)))
+                {
+                    self.review_cmd = None;
+                    let scope = self.scope;
+                    self.queue(bd::Job::ReviewCmd { scope });
+                    return self.status_msg = format!("{e} (checking again: press L once it's set)");
+                }
+                return self.status_msg = e;
+            }
         };
-        let log = std::env::temp_dir().join("herdr-beads-launch.log");
+        self.launched.insert(id.clone());
+        let log = std::env::temp_dir().join(format!("herdr-beads-launch-{id}.log"));
         let out = match std::fs::File::create(&log) {
             Ok(f) => f,
             Err(e) => return self.status_msg = format!("launch: {e}"),
@@ -794,8 +839,10 @@ impl App {
                 .unwrap_or_default();
             let _ = tx.send(bd::Reply::Launched(if ok {
                 Ok(())
+            } else if last.is_empty() {
+                Err(format!("launch failed, see {}", log.display()))
             } else {
-                Err(format!("{last} (see {})", log.display()))
+                Err(format!("launch failed: {last}, see {}", log.display()))
             }));
         });
     }
@@ -810,6 +857,14 @@ impl App {
             self.status_msg = "P passes a verify item (labels human + verify)".into();
             return;
         };
+        // After a verdict the selection moves on to the next item; a stray second P mustn't pass
+        // a lane nobody looked at. Items launched here pass in one press, others in two.
+        if !self.launched.contains(&id) && self.confirm_pass.as_ref() != Some(&id) {
+            self.status_msg = format!("you haven't launched {id} here (L): press P again to pass it anyway");
+            self.confirm_pass = Some(id);
+            return;
+        }
+        self.confirm_pass = None;
         let scope = self.scope;
         self.queue_write(move || {
             bd::human_respond(scope, &id, &bd::answer(true, "")).map(|_| "passed".into())
@@ -988,15 +1043,129 @@ mod review_tests {
         Bead { id: id.into(), status: "open".into(), labels: labels.iter().map(|s| s.to_string()).collect(), ..Default::default() }
     }
 
+    fn own_pgid() -> u32 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        stat.rsplit(')').next().unwrap().split_whitespace().nth(2).unwrap().parse().unwrap()
+    }
+
+    fn verify_app(ids: &[&str]) -> App {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        app.beads = ids.iter().map(|id| bead(id, &["human", "verify"])).collect();
+        app.selected = Some(ids[0].into());
+        app
+    }
+
+    /// Apply replies until the status line satisfies `done` (a launch reports from its own thread).
+    fn wait_status(app: &mut App, done: impl Fn(&str) -> bool) {
+        for _ in 0..60 {
+            app.apply_replies();
+            if done(&app.status_msg) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Minors 1 and 6: each launch logs to its own file, and a failure names it after the last line.
+    #[test]
+    fn a_failed_launch_reports_its_last_line_and_its_own_log() {
+        let mut app = verify_app(&["v1"]);
+        app.review_cmd = Some(Ok(vec!["sh".into(), "-c".into(), "echo boom; exit 3".into()]));
+        app.launch_selected();
+        wait_status(&mut app, |s| s.starts_with("launch failed"));
+        let log = std::env::temp_dir().join("herdr-beads-launch-v1.log");
+        assert_eq!(app.status_msg, format!("launch failed: boom, see {}", log.display()));
+    }
+
+    /// Minor 6: a clean exit replaces "launching Godot…".
+    #[test]
+    fn a_clean_launch_says_it_finished() {
+        let mut app = verify_app(&["v2"]);
+        app.review_cmd = Some(Ok(vec!["true".into()]));
+        app.launch_selected();
+        wait_status(&mut app, |s| s != "launching Godot…");
+        assert_eq!(app.status_msg, "review launch finished");
+    }
+
+    /// Minor 2: L with no config (or a failed read) reads the config again for the next press.
+    #[test]
+    fn launch_rechecks_a_missing_config() {
+        let mut app = verify_app(&["v3"]);
+        app.review_cmd = Some(Ok(vec![]));
+        app.launch_selected();
+        assert!(app.status_msg.contains("checking again"), "{}", app.status_msg);
+        assert!(app.review_cmd.is_none(), "no re-read queued");
+    }
+
+    /// Minor 3: a Show that was in flight when a note invalidated the detail can't refill it.
+    #[test]
+    fn a_stale_show_doesnt_refill_an_invalidated_detail() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        let before = app.show_seq;
+        app.invalidate_detail("x");
+        app.replies_tx.send(bd::Reply::Shown { id: "x".into(), bead: bead("x", &[]), seq: before }).unwrap();
+        app.apply_replies();
+        assert!(!app.detail_cache.contains_key("x"), "the stale reply refilled the detail");
+        app.replies_tx.send(bd::Reply::Shown { id: "x".into(), bead: bead("x", &[]), seq: before + 1 }).unwrap();
+        app.apply_replies();
+        assert!(app.detail_cache.contains_key("x"), "a fresh reply was dropped");
+    }
+
+    /// Minor 4: the popup's hints keep "q close" on human items (q is its only way out).
+    #[test]
+    fn popup_hints_keep_q_close() {
+        let mut app = App::new(Mode::Popup, Scope::Repo);
+        app.beads = vec![bead("v", &["human", "verify"]), bead("q", &["human"])];
+        for id in ["v", "q"] {
+            app.selected = Some(id.into());
+            assert!(crate::ui::widgets::hint(&app).starts_with("q close · "), "{id}: {}", crate::ui::widgets::hint(&app));
+        }
+    }
+
+    /// Minor 7: P on an item never launched here asks first, so a stray second P can't pass the
+    /// next lane in the queue.
+    #[test]
+    fn p_on_an_unlaunched_item_asks_first() {
+        let mut app = verify_app(&["a", "b"]);
+        app.pass_selected();
+        assert!(app.status_msg.contains("haven't launched"), "{}", app.status_msg);
+        app.pass_selected();
+        assert_eq!(app.status_msg, "working…");
+        app.launched.insert("b".into());
+        app.selected = Some("b".into());
+        app.pass_selected();
+        assert_eq!(app.status_msg, "working…");
+    }
+
+    /// Minor 8: a worker that died is reported without waiting for a key.
+    #[test]
+    fn a_dead_worker_is_reported() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        app.queue_write(|| panic!("worker test panic"));
+        wait_status(&mut app, |s| s.contains("worker died"));
+        assert!(app.status_msg.contains("worker died"), "{}", app.status_msg);
+    }
+
+    /// Minor 9: bd runs in its own process group, so closing the pane mid-write doesn't hang it up.
+    #[test]
+    fn bd_runs_in_its_own_process_group() {
+        let out = crate::bd::command("sh").args(["-c", "ps -o pgid= -p $$"]).output().unwrap();
+        let child: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_ne!(child, own_pgid());
+    }
+
     /// Review Focus 4: before the config arrives L says so, rather than "no config".
     #[test]
     fn launch_argv_by_config_state() {
         let mut app = App::new(Mode::Dock, Scope::Repo);
         app.review_cmd = None;
         assert!(app.launch_argv("v").unwrap_err().contains("still reading"));
-        app.review_cmd = Some(vec![]);
+        app.review_cmd = Some(Ok(vec![]));
         assert!(app.launch_argv("v").unwrap_err().contains("custom.herdr-beads.review"));
-        app.review_cmd = Some(vec!["tools/review.sh".into()]);
+        app.review_cmd = Some(Err("dolt is locked".into()));
+        let e = app.launch_argv("v").unwrap_err();
+        assert!(e.contains("couldn't read") && e.contains("dolt is locked"), "{e}");
+        app.review_cmd = Some(Ok(vec!["tools/review.sh".into()]));
         assert_eq!(app.launch_argv("v").unwrap(), ["tools/review.sh", "launch", "v"]);
     }
 
@@ -1035,7 +1204,7 @@ mod review_tests {
         let out = std::env::temp_dir().join(format!("hb-pgid-{}", std::process::id()));
         let _ = std::fs::remove_file(&out);
         let script = format!("ps -o pgid= -p $$ > {}", out.display());
-        app.review_cmd = Some(vec!["sh".into(), "-c".into(), script]);
+        app.review_cmd = Some(Ok(vec!["sh".into(), "-c".into(), script]));
         app.beads = vec![bead("v", &["human", "verify"])];
         app.selected = Some("v".into());
         app.launch_selected();
@@ -1046,9 +1215,7 @@ mod review_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let child: u32 = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
-        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-        let own: u32 = stat.rsplit(')').next().unwrap().split_whitespace().nth(2).unwrap().parse().unwrap();
-        assert_ne!(child, own, "the launch shares the board's process group");
+        assert_ne!(child, own_pgid(), "the launch shares the board's process group");
         let _ = std::fs::remove_file(&out);
     }
 
