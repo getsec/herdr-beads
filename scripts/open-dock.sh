@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Toggle the beads dock in the current tab, docked on the LEFT edge and scoped
+# Toggle the beads dock in the current tab, docked on the RIGHT edge and scoped
 # to the focused pane's repo.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"

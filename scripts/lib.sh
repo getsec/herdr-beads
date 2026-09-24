@@ -89,11 +89,11 @@ for p in (d.get("result") or {}).get("panes") or []:
 ' 2>/dev/null || true
 }
 
-# Split the dock off pane $1, dock it on the LEFT edge, narrow it to a sidebar.
+# Split the dock off pane $1, dock it on the RIGHT edge, narrow it to a sidebar.
 # $2 is a cwd hint for the board, $3 is "focus" or "nofocus".
 #
-# herdr's `pane split` only goes right/down, so the new pane is swapped left
-# until it reaches the edge. Every step targets the dock by id rather than the
+# `pane split --direction right` puts the new pane right of the target, so it
+# is swapped right until it reaches the edge. Every step targets the dock by id rather than the
 # focused pane, so this works whether or not the dock took focus.
 open_dock_at() {
   local target="$1" cwd="$2" focus_flag="--focus"
@@ -135,13 +135,16 @@ if p:
 ' 2>/dev/null || true)"
   [ -n "$dock" ] || return 0
 
+  # `pane neighbor` exits 0 even at the edge; only neighbor_pane_id says there
+  # is still a pane to swap with.
   for _ in 1 2 3 4 5 6; do
-    "$HERDR_BIN" pane neighbor --direction left --pane "$dock" >/dev/null 2>&1 || break
-    "$HERDR_BIN" pane swap --direction left --pane "$dock" >/dev/null 2>&1 || break
+    "$HERDR_BIN" pane neighbor --direction right --pane "$dock" 2>/dev/null | grep -q neighbor_pane_id || break
+    "$HERDR_BIN" pane swap --direction right --pane "$dock" >/dev/null 2>&1 || break
   done
 
-  # The dock sits on the LEFT now, so shrink its inner (right) edge.
-  "$HERDR_BIN" pane resize --direction left --amount 0.18 --pane "$dock" >/dev/null 2>&1
+  # The dock sits on the RIGHT now; resizing right moves its inner (left) edge
+  # right, shrinking it to ~a third of the tab.
+  "$HERDR_BIN" pane resize --direction right --amount 0.18 --pane "$dock" >/dev/null 2>&1
 }
 
 # tab_id of the focused tab in this workspace.
