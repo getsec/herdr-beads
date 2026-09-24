@@ -201,6 +201,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App, started: Instan
         match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 pending = Some((Instant::now(), format!("key {:?}", k.code)));
+                app.error_shown = false; // seen: the next status message may replace it
                 keys::handle_key(&mut app, k)
             }
             Event::Mouse(m) => keys::handle_mouse(&mut app, m),
@@ -211,5 +212,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App, started: Instan
             break;
         }
     }
+    // Queued writes (a verdict, a close) still have to reach bd before the process exits.
+    app.status_msg = "finishing bd writes…".into();
+    terminal.draw(|f| ui::render(f, &mut app))?;
+    app.finish();
     Ok(())
 }

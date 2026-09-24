@@ -57,17 +57,21 @@ pub struct App {
     /// in `apply_replies`. `load_gen` drops a load that a newer one superseded.
     jobs: Sender<bd::Job>,
     replies: Receiver<bd::Reply>,
+    /// Joined by `finish`, so quitting never drops a queued write.
+    worker: Option<std::thread::JoinHandle<()>>,
     /// For threads outside the worker (a launch waiting on its process).
     replies_tx: Sender<bd::Reply>,
     /// The repo's review command (None until the worker has read it; empty when unset).
     pub review_cmd: Option<Vec<String>>,
+    /// A bd error is on the status line: the reload after it keeps it there until the next key.
+    pub error_shown: bool,
     load_gen: u64,
     load_queued: std::time::Instant,
 }
 
 impl App {
     pub fn new(mode: Mode, scope: Scope) -> Self {
-        let (jobs, replies_tx, replies) = bd::spawn_worker();
+        let (jobs, replies_tx, replies, worker) = bd::spawn_worker();
         let mut app = App {
             mode,
             scope,
@@ -95,7 +99,9 @@ impl App {
             jobs,
             replies,
             replies_tx,
+            worker: Some(worker),
             review_cmd: None,
+            error_shown: false,
             load_gen: 0,
             load_queued: std::time::Instant::now(),
         };
@@ -124,6 +130,15 @@ impl App {
         }
     }
 
+    /// Let every queued bd call finish, then stop the worker. Called on quit: a verdict (P, R)
+    /// queued behind a slow reload must still reach bd.
+    pub fn finish(&mut self) {
+        drop(std::mem::replace(&mut self.jobs, std::sync::mpsc::channel().0));
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+
     /// Queue a bd write. The caller queues whatever refresh should follow it;
     /// the worker runs jobs in order, so that refresh sees the write.
     fn queue_write(&mut self, f: impl FnOnce() -> anyhow::Result<String> + Send + 'static) {
@@ -143,7 +158,10 @@ impl App {
                     self.detail_cache.insert(id, bead);
                 }
                 bd::Reply::Wrote(Ok(msg)) => self.status_msg = msg,
-                bd::Reply::Wrote(Err(e)) => self.status_msg = format!("bd error: {e}"),
+                bd::Reply::Wrote(Err(e)) => {
+                    self.status_msg = format!("bd error: {e}");
+                    self.error_shown = true;
+                }
                 bd::Reply::ReviewCmd(argv) => self.review_cmd = Some(argv),
                 bd::Reply::Launched(Ok(())) => {}
                 bd::Reply::Launched(Err(e)) => self.status_msg = format!("launch failed: {e}"),
@@ -156,7 +174,9 @@ impl App {
         crate::trace("  load queued → applied", self.load_queued.elapsed());
         match beads {
             Ok(b) => {
-                self.status_msg = format!("{} beads · {}", b.len(), self.scope.label());
+                if !self.error_shown {
+                    self.status_msg = format!("{} beads · {}", b.len(), self.scope.label());
+                }
                 self.beads = b;
             }
             Err(e) => {
@@ -743,8 +763,10 @@ impl App {
             Ok(f) => f,
             Err(e) => return self.status_msg = format!("launch: {e}"),
         };
+        use std::os::unix::process::CommandExt;
         let spawned = std::process::Command::new(&argv[0])
             .args(&argv[1..])
+            .process_group(0) // detached: closing the board's pane mustn't hang up a running review
             .stdin(std::process::Stdio::null())
             .stdout(
                 out.try_clone()
@@ -976,6 +998,58 @@ mod review_tests {
         assert!(app.launch_argv("v").unwrap_err().contains("custom.herdr-beads.review"));
         app.review_cmd = Some(vec!["tools/review.sh".into()]);
         assert_eq!(app.launch_argv("v").unwrap(), ["tools/review.sh", "launch", "v"]);
+    }
+
+    /// Review finding 1: q must not drop a verdict still queued behind a slow bd call.
+    #[test]
+    fn finishing_waits_for_queued_writes() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        let f = std::env::temp_dir().join(format!("hb-finish-{}", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        let g = f.clone();
+        app.queue_write(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::write(&g, "done")?;
+            Ok("ok".into())
+        });
+        app.finish();
+        assert!(f.exists(), "the queued write never ran");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// Review finding 2: the reload queued after a failed write mustn't wipe its error.
+    #[test]
+    fn a_write_error_survives_the_reload_after_it() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        let gen = app.load_gen;
+        app.replies_tx.send(bd::Reply::Wrote(Err(anyhow::anyhow!("boom")))).unwrap();
+        app.replies_tx.send(bd::Reply::Loaded { gen, beads: Ok(vec![]) }).unwrap();
+        app.apply_replies();
+        assert!(app.status_msg.contains("bd error: boom"), "{}", app.status_msg);
+    }
+
+    /// Review finding 3: L's process outlives the board (closing the pane mustn't kill a review).
+    #[test]
+    fn launch_runs_in_its_own_process_group() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        let out = std::env::temp_dir().join(format!("hb-pgid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let script = format!("ps -o pgid= -p $$ > {}", out.display());
+        app.review_cmd = Some(vec!["sh".into(), "-c".into(), script]);
+        app.beads = vec![bead("v", &["human", "verify"])];
+        app.selected = Some("v".into());
+        app.launch_selected();
+        for _ in 0..40 {
+            if std::fs::read_to_string(&out).is_ok_and(|s| !s.trim().is_empty()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let child: u32 = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let own: u32 = stat.rsplit(')').next().unwrap().split_whitespace().nth(2).unwrap().parse().unwrap();
+        assert_ne!(child, own, "the launch shares the board's process group");
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

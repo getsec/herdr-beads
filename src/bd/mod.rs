@@ -250,11 +250,11 @@ pub enum Reply {
 /// One thread runs every job in order, so a write always lands before the
 /// reload queued after it. Of the jobs waiting in the queue, only the newest
 /// load and the newest show run: the older ones are already stale.
-pub fn spawn_worker() -> (Sender<Job>, Sender<Reply>, Receiver<Reply>) {
+pub fn spawn_worker() -> (Sender<Job>, Sender<Reply>, Receiver<Reply>, std::thread::JoinHandle<()>) {
     let (jobs, queue) = channel::<Job>();
     let (replies, inbox) = channel();
     let launches = replies.clone();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         while let Ok(first) = queue.recv() {
             let mut batch = vec![first];
             batch.extend(queue.try_iter());
@@ -283,7 +283,7 @@ pub fn spawn_worker() -> (Sender<Job>, Sender<Reply>, Receiver<Reply>) {
             }
         }
     });
-    (jobs, launches, inbox)
+    (jobs, launches, inbox, worker)
 }
 
 /// Which jobs in a batch to skip: every load but the last, every show but the
