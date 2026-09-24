@@ -105,16 +105,26 @@ pub fn render_activity_bar(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(bar, area);
 }
 
+/// The bottom bar's key hint: what you can do with what's selected.
+pub fn hint(app: &App) -> String {
+    let h = if app.human_only { "H all" } else { "H queue" };
+    match app.selected_bead() {
+        _ if app.move_mode => "MOVE: h/l retag · v/Esc exit".into(),
+        Some(b) if b.is_verify() => {
+            format!("✔ L launch Godot · P pass · R fail+notes · {h} · ? help")
+        }
+        Some(b) if b.needs_human() => format!("⚑ R answer · {h} · d details · ? help"),
+        _ if app.mode == Mode::Popup => {
+            "q close board · K view · j/k move · c claim · x close · a new · / filter · H human queue · ? help".into()
+        }
+        _ => "K view · j/k move · v move-mode · c claim · x close · a new · / filter · H human queue · ? help · q quit".into(),
+    }
+}
+
 pub fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     // The board is a herdr popup: it grabs every key, the toggle cannot reach it,
     // and Esc only backs out a layer. `q` is the only way out, so it leads.
-    let hint = if app.move_mode {
-        "MOVE: h/l retag · v/Esc exit"
-    } else if app.mode == Mode::Popup {
-        "q close board · K view · j/k move · c claim · x close · a new · / filter · ? help"
-    } else {
-        "K view · j/k move · v move-mode · c claim · x close · a new · / filter · g scope · ? help · q quit"
-    };
+    let hint = hint(app);
     let left = Span::styled(
         format!(" {} ", app.status_msg),
         Style::default().fg(theme::GREEN),
@@ -174,7 +184,7 @@ pub fn render_input(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme::MAUVE))
-        .title(format!(" {} ", inp.title))
+        .title(format!(" {} · Enter send · Esc cancel ", inp.title))
         .style(Style::default().bg(Color::Reset));
     let text = Line::from(vec![
         Span::styled("› ", Style::default().fg(theme::MAUVE)),

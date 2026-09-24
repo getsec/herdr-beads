@@ -102,6 +102,10 @@ impl Bead {
     pub fn needs_human(&self) -> bool {
         !self.is_closed() && self.labels.iter().any(|l| l == "human")
     }
+    /// A human review of a lane (tools/review.sh file): answered with P (pass) or R (fail).
+    pub fn is_verify(&self) -> bool {
+        self.needs_human() && self.labels.iter().any(|l| l == "verify")
+    }
 
     /// The blocking edges only (dependencies of kind blocks / depends-on).
     pub fn blocking_deps(&self) -> impl Iterator<Item = &Dependency> {

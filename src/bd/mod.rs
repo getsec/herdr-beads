@@ -112,6 +112,30 @@ pub fn human_respond(scope: Scope, id: &str, text: &str) -> Result<()> {
     run(scope, &["human", "respond", id, "-r", text]).map(|_| ())
 }
 
+/// The answer text for a verify item; tools/review.sh reads `pass` and `fail: <notes>`.
+pub fn answer(pass: bool, notes: &str) -> String {
+    if pass {
+        "pass".into()
+    } else {
+        format!("fail: {}", notes.trim())
+    }
+}
+
+/// The repo's review command (`bd config set custom.herdr-beads.review …`), split into argv;
+/// empty when it isn't set.
+pub fn review_command(scope: Scope) -> Result<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(&run(
+        scope,
+        &["config", "get", "custom.herdr-beads.review", "--json"],
+    )?)?;
+    Ok(v["value"]
+        .as_str()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(String::from)
+        .collect())
+}
+
 pub struct NewBead<'a> {
     pub title: &'a str,
     pub issue_type: &'a str,
@@ -208,6 +232,8 @@ pub fn update_bead(scope: Scope, id: &str, nb: &NewBead) -> Result<()> {
 pub enum Job {
     Load { gen: u64, scope: Scope, closed: bool },
     Show { scope: Scope, id: String },
+    /// Read the repo's review command (see `review_command`).
+    ReviewCmd { scope: Scope },
     /// A write. Ok carries the status message to show.
     Write(Box<dyn FnOnce() -> Result<String> + Send>),
 }
@@ -216,14 +242,18 @@ pub enum Reply {
     Loaded { gen: u64, beads: Result<Vec<Bead>> },
     Shown { id: String, bead: Bead },
     Wrote(Result<String>),
+    ReviewCmd(Vec<String>),
+    /// A launch (L) exited; Err carries its last output line.
+    Launched(std::result::Result<(), String>),
 }
 
 /// One thread runs every job in order, so a write always lands before the
 /// reload queued after it. Of the jobs waiting in the queue, only the newest
 /// load and the newest show run: the older ones are already stale.
-pub fn spawn_worker() -> (Sender<Job>, Receiver<Reply>) {
+pub fn spawn_worker() -> (Sender<Job>, Sender<Reply>, Receiver<Reply>) {
     let (jobs, queue) = channel::<Job>();
     let (replies, inbox) = channel();
+    let launches = replies.clone();
     std::thread::spawn(move || {
         while let Ok(first) = queue.recv() {
             let mut batch = vec![first];
@@ -242,6 +272,9 @@ pub fn spawn_worker() -> (Sender<Job>, Receiver<Reply>) {
                         Ok(Some(bead)) => Reply::Shown { id, bead },
                         _ => continue,
                     },
+                    Job::ReviewCmd { scope } => {
+                        Reply::ReviewCmd(review_command(scope).unwrap_or_default())
+                    }
                     Job::Write(f) => Reply::Wrote(f()),
                 };
                 if replies.send(reply).is_err() {
@@ -250,7 +283,7 @@ pub fn spawn_worker() -> (Sender<Job>, Receiver<Reply>) {
             }
         }
     });
-    (jobs, inbox)
+    (jobs, launches, inbox)
 }
 
 /// Which jobs in a batch to skip: every load but the last, every show but the
@@ -262,7 +295,7 @@ fn superseded(batch: &[Job]) -> Vec<bool> {
         .map(|i| match batch[i] {
             Job::Load { .. } => Some(i) != last_load,
             Job::Show { .. } => Some(i) != last_show,
-            Job::Write(_) => false,
+            Job::ReviewCmd { .. } | Job::Write(_) => false,
         })
         .collect()
 }
@@ -322,6 +355,23 @@ mod tests {
         ]"#;
         let waiting: Vec<_> = parse_list(s).unwrap().into_iter().filter(|b| b.needs_human()).map(|b| b.id).collect();
         assert_eq!(waiting, ["a"]);
+    }
+
+    #[test]
+    fn verify_items_are_open_human_beads_labelled_verify() {
+        let s = r#"[
+            {"id":"v","status":"open","labels":["human","verify"]},
+            {"id":"q","status":"open","labels":["human"]},
+            {"id":"done","status":"closed","labels":["human","verify"]}
+        ]"#;
+        let v: Vec<_> = parse_list(s).unwrap().into_iter().filter(|b| b.is_verify()).map(|b| b.id).collect();
+        assert_eq!(v, ["v"]);
+    }
+
+    #[test]
+    fn answers_match_what_review_sh_reads() {
+        assert_eq!(answer(true, "ignored"), "pass");
+        assert_eq!(answer(false, "  too quiet "), "fail: too quiet");
     }
 
     #[test]

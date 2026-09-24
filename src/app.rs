@@ -57,13 +57,17 @@ pub struct App {
     /// in `apply_replies`. `load_gen` drops a load that a newer one superseded.
     jobs: Sender<bd::Job>,
     replies: Receiver<bd::Reply>,
+    /// For threads outside the worker (a launch waiting on its process).
+    replies_tx: Sender<bd::Reply>,
+    /// The repo's review command (None until the worker has read it; empty when unset).
+    pub review_cmd: Option<Vec<String>>,
     load_gen: u64,
     load_queued: std::time::Instant,
 }
 
 impl App {
     pub fn new(mode: Mode, scope: Scope) -> Self {
-        let (jobs, replies) = bd::spawn_worker();
+        let (jobs, replies_tx, replies) = bd::spawn_worker();
         let mut app = App {
             mode,
             scope,
@@ -90,11 +94,14 @@ impl App {
             hits: Hits::default(),
             jobs,
             replies,
+            replies_tx,
+            review_cmd: None,
             load_gen: 0,
             load_queued: std::time::Instant::now(),
         };
         app.status_msg = "loading…".into();
         app.reload();
+        app.queue(bd::Job::ReviewCmd { scope });
         app
     }
 
@@ -137,6 +144,9 @@ impl App {
                 }
                 bd::Reply::Wrote(Ok(msg)) => self.status_msg = msg,
                 bd::Reply::Wrote(Err(e)) => self.status_msg = format!("bd error: {e}"),
+                bd::Reply::ReviewCmd(argv) => self.review_cmd = Some(argv),
+                bd::Reply::Launched(Ok(())) => {}
+                bd::Reply::Launched(Err(e)) => self.status_msg = format!("launch failed: {e}"),
             }
         }
         changed
@@ -587,6 +597,7 @@ impl App {
             InputKind::Priority(_) => "Priority 0-4".into(),
             InputKind::Comment(_) => "Comment".into(),
             InputKind::Respond(id) => format!("Answer {id} (closes it)"),
+            InputKind::Fail(_) => "Fail: what's wrong?".into(),
         };
         let buffer = if let InputKind::Filter = kind {
             self.filter.clone()
@@ -635,6 +646,19 @@ impl App {
                 }
                 _ => self.status_msg = "priority must be 0-4".into(),
             },
+            InputKind::Fail(id) => {
+                if buf.is_empty() {
+                    self.status_msg = "say what's wrong, so the lane can fix it".into();
+                    self.open_input(InputKind::Fail(id));
+                    return;
+                }
+                let scope = self.scope;
+                self.queue_write(move || {
+                    bd::human_respond(scope, &id, &bd::answer(false, &buf))
+                        .map(|_| "failed: sent to the lane".into())
+                });
+                self.reload();
+            }
             InputKind::Respond(id) => {
                 if buf.is_empty() {
                     self.status_msg = "answer is empty".into();
@@ -675,6 +699,10 @@ impl App {
     /// `R` on a human-queue bead; on anything else, say why nothing opened.
     pub fn respond_selected(&mut self) {
         match self.selected_bead() {
+            Some(b) if b.is_verify() => {
+                let id = b.id.clone();
+                self.open_input(InputKind::Fail(id));
+            }
             Some(b) if b.needs_human() => {
                 let id = b.id.clone();
                 self.open_input(InputKind::Respond(id));
@@ -682,6 +710,89 @@ impl App {
             Some(_) => self.status_msg = "not in the human queue (no `human` label)".into(),
             None => {}
         }
+    }
+
+    /// The argv L runs for verify item `id`, or why it can't run.
+    pub fn launch_argv(&self, id: &str) -> Result<Vec<String>, String> {
+        match &self.review_cmd {
+            None => Err("still reading this repo's review command, try again in a moment".into()),
+            Some(cmd) if cmd.is_empty() => {
+                Err("no custom.herdr-beads.review in this repo's bd config".into())
+            }
+            Some(cmd) => Ok(cmd
+                .iter()
+                .cloned()
+                .chain(["launch".into(), id.to_string()])
+                .collect()),
+        }
+    }
+
+    /// L: launch the selected verify item. Runs detached with no shell; a waiting thread reports a
+    /// non-zero exit with the last line of its output.
+    pub fn launch_selected(&mut self) {
+        let Some(b) = self.selected_bead().filter(|b| b.is_verify()) else {
+            self.status_msg = "L launches a verify item (labels human + verify)".into();
+            return;
+        };
+        let argv = match self.launch_argv(&b.id) {
+            Ok(a) => a,
+            Err(e) => return self.status_msg = e,
+        };
+        let log = std::env::temp_dir().join("herdr-beads-launch.log");
+        let out = match std::fs::File::create(&log) {
+            Ok(f) => f,
+            Err(e) => return self.status_msg = format!("launch: {e}"),
+        };
+        let spawned = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(
+                out.try_clone()
+                    .map(std::process::Stdio::from)
+                    .unwrap_or(std::process::Stdio::null()),
+            )
+            .stderr(out)
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => return self.status_msg = format!("launch: {} failed to start: {e}", argv[0]),
+        };
+        self.status_msg = "launching Godot…".into();
+        let tx = self.replies_tx.clone();
+        std::thread::spawn(move || {
+            let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+            let last = std::fs::read_to_string(&log)
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .map(String::from)
+                })
+                .unwrap_or_default();
+            let _ = tx.send(bd::Reply::Launched(if ok {
+                Ok(())
+            } else {
+                Err(format!("{last} (see {})", log.display()))
+            }));
+        });
+    }
+
+    /// P: pass the selected verify item.
+    pub fn pass_selected(&mut self) {
+        let Some(id) = self
+            .selected_bead()
+            .filter(|b| b.is_verify())
+            .map(|b| b.id.clone())
+        else {
+            self.status_msg = "P passes a verify item (labels human + verify)".into();
+            return;
+        };
+        let scope = self.scope;
+        self.queue_write(move || {
+            bd::human_respond(scope, &id, &bd::answer(true, "")).map(|_| "passed".into())
+        });
+        self.reload();
     }
 
     pub fn toggle_closed(&mut self) {
@@ -843,5 +954,39 @@ mod auto_dock_tests {
         assert!(app.status_msg.contains("needs herdr"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::model::{Mode, Scope};
+
+    fn bead(id: &str, labels: &[&str]) -> Bead {
+        Bead { id: id.into(), status: "open".into(), labels: labels.iter().map(|s| s.to_string()).collect(), ..Default::default() }
+    }
+
+    /// Review Focus 4: before the config arrives L says so, rather than "no config".
+    #[test]
+    fn launch_argv_by_config_state() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        app.review_cmd = None;
+        assert!(app.launch_argv("v").unwrap_err().contains("still reading"));
+        app.review_cmd = Some(vec![]);
+        assert!(app.launch_argv("v").unwrap_err().contains("custom.herdr-beads.review"));
+        app.review_cmd = Some(vec!["tools/review.sh".into()]);
+        assert_eq!(app.launch_argv("v").unwrap(), ["tools/review.sh", "launch", "v"]);
+    }
+
+    #[test]
+    fn hint_follows_the_selection() {
+        let mut app = App::new(Mode::Dock, Scope::Repo);
+        app.beads = vec![bead("v", &["human", "verify"]), bead("q", &["human"]), bead("t", &[])];
+        app.selected = Some("v".into());
+        assert!(crate::ui::widgets::hint(&app).starts_with("✔ L launch Godot · P pass · R fail+notes"));
+        app.selected = Some("q".into());
+        assert!(crate::ui::widgets::hint(&app).starts_with("⚑ R answer"));
+        app.selected = Some("t".into());
+        assert!(crate::ui::widgets::hint(&app).contains("H human queue"));
     }
 }

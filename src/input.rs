@@ -14,6 +14,8 @@ pub enum InputKind {
     Comment(String),
     /// answer the given human-queue bead (`bd human respond`)
     Respond(String),
+    /// fail the given verify item, with what's wrong
+    Fail(String),
 }
 
 #[derive(Debug, Clone)]

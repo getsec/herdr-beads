@@ -28,7 +28,7 @@ pub fn bead_line(b: &Bead, width: u16) -> Line<'static> {
             Style::default().fg(theme::priority_color(b.priority)),
         ),
         Span::styled(
-            format!("{} ", theme::type_glyph(&b.issue_type)),
+            format!("{} ", if b.is_verify() { "✔" } else { theme::type_glyph(&b.issue_type) }),
             Style::default().fg(theme::type_color(&b.issue_type)),
         ),
         Span::styled(
