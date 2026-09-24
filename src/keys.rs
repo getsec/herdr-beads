@@ -29,6 +29,8 @@ pub fn help_lines() -> Vec<(&'static str, &'static str)> {
         ("p", "set priority (0-4)"),
         ("n", "add note (bd note)"),
         ("m", "add comment (bd comment)"),
+        ("H", "human queue only (toggle)"),
+        ("R", "answer a human-queue bead (closes it)"),
         (
             "a",
             "new bead form (Tab: field · ←→: type/priority · Enter: create)",
@@ -249,6 +251,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') => app.g_pending = true,
         KeyCode::Char('S') => app.toggle_scope(),
         KeyCode::Char('C') => app.toggle_closed(),
+        KeyCode::Char('H') => app.toggle_human_only(),
+        KeyCode::Char('R') => app.respond_selected(),
         KeyCode::Char('r') => app.reload(),
         KeyCode::Char('f') => app.toggle_zoom(),
         _ => {}

@@ -24,6 +24,34 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 use std::io;
+use std::io::Write;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Opt-in latency log. `touch "$(herdr plugin config-dir herdr-beads)/trace"`
+/// turns it on for panes opened afterwards; lines land in `latency.log` beside
+/// the marker. With no marker this is one cached lookup and a return.
+pub fn trace(what: &str, took: Duration) {
+    static LOG: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = LOG.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")?);
+        dir.join("trace").exists().then(|| dir.join("latency.log"))
+    }) else {
+        return;
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let line = format!(
+        "{}.{:03} pid={} {:>8.1}ms {what}\n",
+        now.as_secs(),
+        now.subsec_millis(),
+        std::process::id(),
+        took.as_secs_f64() * 1000.0
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
 
 fn parse_args() -> (Mode, Scope, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -112,6 +140,7 @@ fn apply_working_dir() {
 }
 
 fn main() -> Result<()> {
+    let started = Instant::now();
     let (mode, scope, selftest) = parse_args();
 
     apply_working_dir();
@@ -135,7 +164,7 @@ fn main() -> Result<()> {
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
-    let res = run_app(&mut terminal, App::new(mode, scope));
+    let res = run_app(&mut terminal, App::new(mode, scope), started);
 
     disable_raw_mode()?;
     execute!(
@@ -148,17 +177,36 @@ fn main() -> Result<()> {
     res
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App, started: Instant) -> Result<()> {
+    // Traced span: key press (or process start) -> the frame that shows its result.
+    let mut pending = Some((started, "startup (first frame)".to_string()));
+    let mut dirty = true;
     loop {
-        terminal.draw(|f| ui::render(f, &mut app))?;
+        // Redraw only when an input or a bd reply changed something. The 50ms
+        // poll is how often finished bd calls get picked up while idle.
+        dirty |= app.apply_replies();
+        if dirty {
+            terminal.draw(|f| ui::render(f, &mut app))?;
+            dirty = false;
+            if let Some((t, what)) = pending.take() {
+                trace(&what, t.elapsed());
+            }
+        }
         if app.should_quit {
             break;
         }
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
         match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => keys::handle_key(&mut app, k),
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                pending = Some((Instant::now(), format!("key {:?}", k.code)));
+                keys::handle_key(&mut app, k)
+            }
             Event::Mouse(m) => keys::handle_mouse(&mut app, m),
             _ => {}
         }
+        dirty = true;
         if app.should_quit {
             break;
         }

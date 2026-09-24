@@ -10,6 +10,7 @@ use crate::model::Scope;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use types::Bead;
 
 fn resolve_bd() -> String {
@@ -39,9 +40,11 @@ pub fn run(scope: Scope, args: &[&str]) -> Result<String> {
         cmd.env("BEADS_DOLT_SHARED_SERVER", "1");
     }
     cmd.args(args);
+    let t = std::time::Instant::now();
     let out = cmd
         .output()
         .with_context(|| format!("failed to spawn bd {}", args.join(" ")))?;
+    crate::trace(&format!("  bd {}", args.first().unwrap_or(&"")), t.elapsed());
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         bail!("bd {}: {}", args.join(" "), err.trim());
@@ -59,20 +62,16 @@ pub fn parse_list(s: &str) -> Result<Vec<Bead>> {
 
 // ---------------------------------------------------------------- reads
 
-/// The full board: `bd list`, augmented with closed issues when asked (bd's
-/// default list omits some done states depending on config).
+/// The full board: `bd list`, plus closed issues when asked. Each bd call costs
+/// ~0.5s on a big repo, so closed comes from one `--all` call rather than a
+/// second list. `--all` also returns pinned, which the default list hides, so
+/// drop it to keep the board the same as the default list plus closed.
 pub fn load(scope: Scope, include_closed: bool) -> Result<Vec<Bead>> {
-    let mut beads = parse_list(&run(scope, &["list", "--json"])?)?;
-    if include_closed {
-        // Best-effort: merge in closed issues. Ignore if the flag is rejected.
-        if let Ok(s) = run(scope, &["list", "--status", "closed", "--json"]) {
-            if let Ok(extra) = parse_list(&s) {
-                let have: std::collections::HashSet<_> =
-                    beads.iter().map(|b| b.id.clone()).collect();
-                beads.extend(extra.into_iter().filter(|b| !have.contains(&b.id)));
-            }
-        }
+    if !include_closed {
+        return parse_list(&run(scope, &["list", "--json"])?);
     }
+    let mut beads = parse_list(&run(scope, &["list", "--all", "--json"])?)?;
+    beads.retain(|b| b.status != "pinned");
     Ok(beads)
 }
 
@@ -106,6 +105,11 @@ pub fn add_note(scope: Scope, id: &str, note: &str) -> Result<()> {
 
 pub fn add_comment(scope: Scope, id: &str, text: &str) -> Result<()> {
     run(scope, &["comment", id, text]).map(|_| ())
+}
+
+/// Answer a human-queue bead: bd adds the text as a comment and closes it.
+pub fn human_respond(scope: Scope, id: &str, text: &str) -> Result<()> {
+    run(scope, &["human", "respond", id, "-r", text]).map(|_| ())
 }
 
 pub struct NewBead<'a> {
@@ -197,9 +201,88 @@ pub fn update_bead(scope: Scope, id: &str, nb: &NewBead) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- worker
+
+/// A bd call for the background worker. bd costs ~0.5s a call on a big repo,
+/// so the UI never waits on one: it queues a job and applies the reply later.
+pub enum Job {
+    Load { gen: u64, scope: Scope, closed: bool },
+    Show { scope: Scope, id: String },
+    /// A write. Ok carries the status message to show.
+    Write(Box<dyn FnOnce() -> Result<String> + Send>),
+}
+
+pub enum Reply {
+    Loaded { gen: u64, beads: Result<Vec<Bead>> },
+    Shown { id: String, bead: Bead },
+    Wrote(Result<String>),
+}
+
+/// One thread runs every job in order, so a write always lands before the
+/// reload queued after it. Of the jobs waiting in the queue, only the newest
+/// load and the newest show run: the older ones are already stale.
+pub fn spawn_worker() -> (Sender<Job>, Receiver<Reply>) {
+    let (jobs, queue) = channel::<Job>();
+    let (replies, inbox) = channel();
+    std::thread::spawn(move || {
+        while let Ok(first) = queue.recv() {
+            let mut batch = vec![first];
+            batch.extend(queue.try_iter());
+            let skip = superseded(&batch);
+            for (job, skip) in batch.into_iter().zip(skip) {
+                if skip {
+                    continue;
+                }
+                let reply = match job {
+                    Job::Load { gen, scope, closed } => Reply::Loaded {
+                        gen,
+                        beads: load(scope, closed),
+                    },
+                    Job::Show { scope, id } => match show(scope, &id) {
+                        Ok(Some(bead)) => Reply::Shown { id, bead },
+                        _ => continue,
+                    },
+                    Job::Write(f) => Reply::Wrote(f()),
+                };
+                if replies.send(reply).is_err() {
+                    return; // the UI is gone
+                }
+            }
+        }
+    });
+    (jobs, inbox)
+}
+
+/// Which jobs in a batch to skip: every load but the last, every show but the
+/// last. Writes always run.
+fn superseded(batch: &[Job]) -> Vec<bool> {
+    let last_load = batch.iter().rposition(|j| matches!(j, Job::Load { .. }));
+    let last_show = batch.iter().rposition(|j| matches!(j, Job::Show { .. }));
+    (0..batch.len())
+        .map(|i| match batch[i] {
+            Job::Load { .. } => Some(i) != last_load,
+            Job::Show { .. } => Some(i) != last_show,
+            Job::Write(_) => false,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_skips_stale_loads_and_shows_but_never_writes() {
+        let load = |gen| Job::Load { gen, scope: Scope::Repo, closed: false };
+        let show = |id: &str| Job::Show { scope: Scope::Repo, id: id.into() };
+        let write = || Job::Write(Box::new(|| Ok(String::new())));
+        let batch = vec![load(1), show("a"), write(), load(2), show("b"), write(), show("c")];
+        assert_eq!(
+            superseded(&batch),
+            [true, true, false, false, true, false, false],
+            "the last load still follows the first write, so it sees it"
+        );
+    }
 
     #[test]
     fn parses_list_fixture() {
@@ -227,6 +310,18 @@ mod tests {
     fn empty_and_whitespace_parse_to_empty() {
         assert!(parse_list("").unwrap().is_empty());
         assert!(parse_list("   \n  ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn human_queue_is_open_beads_labelled_human() {
+        let s = r#"[
+            {"id":"a","status":"open","labels":["human","keyboard"]},
+            {"id":"b","status":"closed","labels":["human"]},
+            {"id":"c","status":"open","labels":["humane"]},
+            {"id":"d","status":"open"}
+        ]"#;
+        let waiting: Vec<_> = parse_list(s).unwrap().into_iter().filter(|b| b.needs_human()).map(|b| b.id).collect();
+        assert_eq!(waiting, ["a"]);
     }
 
     #[test]

@@ -65,6 +65,19 @@ pub fn render_activity_bar(f: &mut Frame, area: Rect, app: &mut App) {
         x += w + 1;
     }
 
+    // The human queue is what the lanes wait on, so it leads, in an alert color.
+    let waiting = app.human_count();
+    if waiting > 0 || app.human_only {
+        let tag = if app.human_only { " only" } else { "" };
+        spans.push(Span::styled(
+            format!(" ⚑ {waiting} human{tag} (H) "),
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // right side: scope, count, move-mode
     let mut right = format!("  scope:{}", app.scope.label());
     if app.show_closed {

@@ -12,6 +12,8 @@ pub enum InputKind {
     Priority(String),
     /// add a comment to the given bead id
     Comment(String),
+    /// answer the given human-queue bead (`bd human respond`)
+    Respond(String),
 }
 
 #[derive(Debug, Clone)]

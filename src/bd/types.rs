@@ -76,6 +76,9 @@ pub struct Bead {
     pub dependent_count: u32,
     #[serde(default)]
     pub comment_count: u32,
+    /// Absent from bd's JSON when empty.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 fn default_status() -> String {
@@ -94,6 +97,11 @@ impl Bead {
     pub fn is_closed(&self) -> bool {
         matches!(self.status.as_str(), "closed")
     }
+    /// In the human queue: an open bead labelled `human` (what `bd human list`
+    /// shows), answered with `bd human respond`.
+    pub fn needs_human(&self) -> bool {
+        !self.is_closed() && self.labels.iter().any(|l| l == "human")
+    }
 
     /// The blocking edges only (dependencies of kind blocks / depends-on).
     pub fn blocking_deps(&self) -> impl Iterator<Item = &Dependency> {
@@ -108,8 +116,13 @@ impl Bead {
     /// A single-line search haystack.
     pub fn haystack(&self) -> String {
         format!(
-            "{} {} {} {} {}",
-            self.id, self.title, self.description, self.issue_type, self.status
+            "{} {} {} {} {} {}",
+            self.id,
+            self.title,
+            self.description,
+            self.issue_type,
+            self.status,
+            self.labels.join(" ")
         )
         .to_lowercase()
     }

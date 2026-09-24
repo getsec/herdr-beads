@@ -8,6 +8,7 @@ use crate::input::{Input, InputKind};
 use crate::model::{status_rank, Mode, Scope, SortKey, View, STATUS_ORDER};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender};
 
 /// Rects captured during render for mouse hit-testing.
 #[derive(Default)]
@@ -32,6 +33,8 @@ pub struct App {
     pub selected: Option<String>,
     pub collapsed: HashSet<String>,
     pub show_closed: bool,
+    /// Show only the human queue (see `Bead::needs_human`).
+    pub human_only: bool,
     pub sort: SortKey,
     pub filter: String,
     pub move_mode: bool,
@@ -50,10 +53,17 @@ pub struct App {
     pub status_msg: String,
     pub should_quit: bool,
     pub hits: Hits,
+    /// bd runs on a worker thread (see `bd::spawn_worker`); replies are applied
+    /// in `apply_replies`. `load_gen` drops a load that a newer one superseded.
+    jobs: Sender<bd::Job>,
+    replies: Receiver<bd::Reply>,
+    load_gen: u64,
+    load_queued: std::time::Instant,
 }
 
 impl App {
     pub fn new(mode: Mode, scope: Scope) -> Self {
+        let (jobs, replies) = bd::spawn_worker();
         let mut app = App {
             mode,
             scope,
@@ -62,6 +72,7 @@ impl App {
             selected: None,
             collapsed: HashSet::new(),
             show_closed: false,
+            human_only: false,
             sort: SortKey::Status,
             filter: String::new(),
             move_mode: false,
@@ -77,7 +88,12 @@ impl App {
             status_msg: String::new(),
             should_quit: false,
             hits: Hits::default(),
+            jobs,
+            replies,
+            load_gen: 0,
+            load_queued: std::time::Instant::now(),
         };
+        app.status_msg = "loading…".into();
         app.reload();
         app
     }
@@ -85,7 +101,50 @@ impl App {
     // ---------------------------------------------------------- data
 
     pub fn reload(&mut self) {
-        match bd::load(self.scope, self.show_closed) {
+        self.load_gen += 1;
+        self.load_queued = std::time::Instant::now();
+        self.queue(bd::Job::Load {
+            gen: self.load_gen,
+            scope: self.scope,
+            closed: self.show_closed,
+        });
+    }
+
+    fn queue(&mut self, job: bd::Job) {
+        // Send fails only if the worker panicked; say so rather than hang.
+        if self.jobs.send(job).is_err() {
+            self.status_msg = "bd worker died - restart the pane".into();
+        }
+    }
+
+    /// Queue a bd write. The caller queues whatever refresh should follow it;
+    /// the worker runs jobs in order, so that refresh sees the write.
+    fn queue_write(&mut self, f: impl FnOnce() -> anyhow::Result<String> + Send + 'static) {
+        self.status_msg = "working…".into();
+        self.queue(bd::Job::Write(Box::new(f)));
+    }
+
+    /// Apply every finished bd call. Returns true if anything changed.
+    pub fn apply_replies(&mut self) -> bool {
+        let replies: Vec<_> = self.replies.try_iter().collect();
+        let changed = !replies.is_empty();
+        for reply in replies {
+            match reply {
+                bd::Reply::Loaded { gen, beads } if gen == self.load_gen => self.apply_load(beads),
+                bd::Reply::Loaded { .. } => {}
+                bd::Reply::Shown { id, bead } => {
+                    self.detail_cache.insert(id, bead);
+                }
+                bd::Reply::Wrote(Ok(msg)) => self.status_msg = msg,
+                bd::Reply::Wrote(Err(e)) => self.status_msg = format!("bd error: {e}"),
+            }
+        }
+        changed
+    }
+
+    fn apply_load(&mut self, beads: anyhow::Result<Vec<Bead>>) {
+        crate::trace("  load queued → applied", self.load_queued.elapsed());
+        match beads {
             Ok(b) => {
                 self.status_msg = format!("{} beads · {}", b.len(), self.scope.label());
                 self.beads = b;
@@ -113,7 +172,9 @@ impl App {
     }
 
     fn is_visible(&self, b: &Bead) -> bool {
-        self.passes_filter(b) && (self.show_closed || !b.is_closed())
+        self.passes_filter(b)
+            && (self.show_closed || !b.is_closed())
+            && (!self.human_only || b.needs_human())
     }
 
     /// Board statuses in column order: known board statuses (minus closed unless
@@ -226,9 +287,8 @@ impl App {
         }
         if let Some(id) = self.selected.clone() {
             if !self.detail_cache.contains_key(&id) {
-                if let Ok(Some(b)) = bd::show(self.scope, &id) {
-                    self.detail_cache.insert(id, b);
-                }
+                let scope = self.scope;
+                self.queue(bd::Job::Show { scope, id });
             }
         }
     }
@@ -343,21 +403,13 @@ impl App {
 
     // ---------------------------------------------------------- mutations
 
-    fn with_selected<F: Fn(&str) -> anyhow::Result<()>>(&mut self, f: F, ok: &str) {
-        if let Some(id) = self.selected.clone() {
-            match f(&id) {
-                Ok(()) => {
-                    self.status_msg = ok.to_string();
-                    self.reload();
-                }
-                Err(e) => self.status_msg = format!("bd error: {e}"),
-            }
-        }
-    }
-
     pub fn claim_selected(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
         let scope = self.scope;
-        self.with_selected(|id| bd::claim(scope, id), "claimed");
+        self.queue_write(move || bd::claim(scope, &id).map(|_| "claimed".into()));
+        self.reload();
     }
 
     /// Toggle this pane between docked and fullscreen via herdr's native zoom.
@@ -401,15 +453,9 @@ impl App {
             return;
         }
         let target = statuses[ni].clone();
-        match bd::set_status(self.scope, &id, &target) {
-            Ok(()) => {
-                self.status_msg = format!("→ {target}");
-                self.reload();
-                self.selected = Some(id);
-                self.ensure_selected();
-            }
-            Err(e) => self.status_msg = format!("bd error: {e}"),
-        }
+        let scope = self.scope;
+        self.queue_write(move || bd::set_status(scope, &id, &target).map(|_| format!("→ {target}")));
+        self.reload();
     }
 
     // ---------------------------------------------------------- input
@@ -461,13 +507,9 @@ impl App {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        match bd::set_status(self.scope, &id, &status) {
-            Ok(_) => {
-                self.status_msg = format!("-> {status}");
-                self.reload();
-            }
-            Err(e) => self.status_msg = format!("bd error: {e}"),
-        }
+        let scope = self.scope;
+        self.queue_write(move || bd::set_status(scope, &id, &status).map(|_| format!("-> {status}")));
+        self.reload();
     }
 
     /// Focus the selected bead's status group: collapse every other group, or
@@ -506,6 +548,8 @@ impl App {
             self.create_form = Some(f);
             return;
         }
+        // The write stays on this thread so a failure can hand the form back
+        // with its input intact; only the reload after it is queued.
         // Scope `nb` (which borrows `f`) so it drops before we may move `f` back.
         let result = {
             let nb = bd::NewBead {
@@ -542,6 +586,7 @@ impl App {
             InputKind::Note(_) => "Note".into(),
             InputKind::Priority(_) => "Priority 0-4".into(),
             InputKind::Comment(_) => "Comment".into(),
+            InputKind::Respond(id) => format!("Answer {id} (closes it)"),
         };
         let buffer = if let InputKind::Filter = kind {
             self.filter.clone()
@@ -570,46 +615,42 @@ impl App {
                     self.open_input(InputKind::CloseReason(id));
                     return;
                 }
-                match bd::close(self.scope, &id, &buf) {
-                    Ok(()) => {
-                        self.status_msg = "closed".into();
-                        self.reload();
-                    }
-                    Err(e) => self.status_msg = format!("bd error: {e}"),
-                }
+                let scope = self.scope;
+                self.queue_write(move || bd::close(scope, &id, &buf).map(|_| "closed".into()));
+                self.reload();
             }
             InputKind::Note(id) => {
                 if !buf.is_empty() {
-                    match bd::add_note(self.scope, &id, &buf) {
-                        Ok(()) => {
-                            self.status_msg = "noted".into();
-                            self.detail_cache.remove(&id);
-                            self.refresh_detail();
-                        }
-                        Err(e) => self.status_msg = format!("bd error: {e}"),
-                    }
+                    let (scope, noted) = (self.scope, id.clone());
+                    self.queue_write(move || bd::add_note(scope, &noted, &buf).map(|_| "noted".into()));
+                    self.detail_cache.remove(&id);
+                    self.refresh_detail();
                 }
             }
             InputKind::Priority(id) => match buf.parse::<u8>() {
-                Ok(p) if p <= 4 => match bd::set_priority(self.scope, &id, p) {
-                    Ok(()) => {
-                        self.status_msg = format!("priority {p}");
-                        self.reload();
-                    }
-                    Err(e) => self.status_msg = format!("bd error: {e}"),
-                },
+                Ok(p) if p <= 4 => {
+                    let scope = self.scope;
+                    self.queue_write(move || bd::set_priority(scope, &id, p).map(|_| format!("priority {p}")));
+                    self.reload();
+                }
                 _ => self.status_msg = "priority must be 0-4".into(),
             },
+            InputKind::Respond(id) => {
+                if buf.is_empty() {
+                    self.status_msg = "answer is empty".into();
+                    self.open_input(InputKind::Respond(id));
+                    return;
+                }
+                let scope = self.scope;
+                self.queue_write(move || bd::human_respond(scope, &id, &buf).map(|_| "answered".into()));
+                self.reload();
+            }
             InputKind::Comment(id) => {
                 if !buf.is_empty() {
-                    match bd::add_comment(self.scope, &id, &buf) {
-                        Ok(()) => {
-                            self.status_msg = "commented".into();
-                            self.detail_cache.remove(&id);
-                            self.refresh_detail();
-                        }
-                        Err(e) => self.status_msg = format!("bd error: {e}"),
-                    }
+                    let (scope, on) = (self.scope, id.clone());
+                    self.queue_write(move || bd::add_comment(scope, &on, &buf).map(|_| "commented".into()));
+                    self.detail_cache.remove(&id);
+                    self.refresh_detail();
                 }
             }
         }
@@ -620,6 +661,27 @@ impl App {
     pub fn toggle_scope(&mut self) {
         self.scope = self.scope.toggled();
         self.reload();
+    }
+
+    pub fn human_count(&self) -> usize {
+        self.beads.iter().filter(|b| b.needs_human()).count()
+    }
+
+    pub fn toggle_human_only(&mut self) {
+        self.human_only = !self.human_only;
+        self.ensure_selected();
+    }
+
+    /// `R` on a human-queue bead; on anything else, say why nothing opened.
+    pub fn respond_selected(&mut self) {
+        match self.selected_bead() {
+            Some(b) if b.needs_human() => {
+                let id = b.id.clone();
+                self.open_input(InputKind::Respond(id));
+            }
+            Some(_) => self.status_msg = "not in the human queue (no `human` label)".into(),
+            None => {}
+        }
     }
 
     pub fn toggle_closed(&mut self) {
